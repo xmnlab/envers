@@ -1,25 +1,43 @@
-"""Envers class for containers."""
+"""Immutable schema releases and current, revisioned profile values.
+
+Each value edit increments its release's revision; password rotation does not.
+Backup restoration reinstates the snapshot and its revision. No value history
+is retained.
+"""
 
 from __future__ import annotations
 
 import copy
-import io
 import os
 import re
 import shutil
 import tempfile
 
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path, PureWindowsPath
-from typing import Any, NoReturn, Optional
+from typing import (
+    Any,
+    Callable,
+    Concatenate,
+    Iterator,
+    NoReturn,
+    Optional,
+    ParamSpec,
+    TypeVar,
+    cast,
+)
 
 import typer
-import yaml  # type: ignore
+import yaml
 
 from cryptography.fernet import InvalidToken
-from dotenv import dotenv_values
 from dotenv.parser import parse_stream
 
-from envers import crypt
+from envers import crypt, storage, validation
+
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
 def raise_error(message: str, exit_code: int = 1) -> NoReturn:
@@ -27,6 +45,31 @@ def raise_error(message: str, exit_code: int = 1) -> NoReturn:
     red_text = typer.style(message, fg=typer.colors.RED, bold=True)
     typer.echo(red_text, err=True, color=True)
     raise typer.Exit(exit_code)
+
+
+def _fail(message: str) -> NoReturn:
+    raise validation.InvalidConfiguration(message)
+
+
+def _locked(
+    method: Callable[Concatenate[Envers, P], R],
+) -> Callable[Concatenate[Envers, P], R]:
+    @wraps(method)
+    def call(self: Envers, /, *args: P.args, **kwargs: P.kwargs) -> R:
+        try:
+            with self._session():
+                return method(self, *args, **kwargs)
+        except (
+            validation.InvalidConfiguration,
+            storage.StorageError,
+        ) as error:
+            raise_error(str(error))
+        except OSError:
+            raise_error(
+                "Storage operation failed; run recover before retrying."
+            )
+
+    return call
 
 
 def merge_dicts(
@@ -99,12 +142,14 @@ def _atomic_write(path: Path, content: str) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
-def _render_dotenv(variables: dict[str, Any]) -> str:
+def _render_dotenv(variables: dict[str, Any], *, compose: bool = False) -> str:
     """Quote literal values for python-dotenv with interpolation disabled."""
     lines = []
     for name, value in variables.items():
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-            raise_error("Invalid dotenv variable name in profile.")
+            _fail("Invalid dotenv variable name in profile.")
+        if isinstance(value, bool):
+            value = "true" if value else "false"
         escaped = (
             str(value)
             .replace("\\", "\\\\")
@@ -112,6 +157,8 @@ def _render_dotenv(variables: dict[str, Any]) -> str:
             .replace("\n", "\\n")
             .replace("\r", "\\r")
         )
+        if compose:
+            escaped = escaped.replace("$", "$$")
         lines.append(f'{name}="{escaped}"\n')
     return "".join(lines)
 
@@ -122,18 +169,18 @@ def _checked_path(root: Path, relative: Path) -> Path:
     try:
         resolved = path.resolve()
     except (OSError, RuntimeError):
-        raise_error("Cannot resolve project path safely.")
+        _fail("Cannot resolve project path safely.")
     if not resolved.is_relative_to(root):
-        raise_error("Project paths must stay within the project root.")
+        _fail("Project paths must stay within the project root.")
     if resolved != path:
-        raise_error("Project paths must not contain redirected components.")
+        _fail("Project paths must not contain redirected components.")
     current = root
     for part in relative.parts:
         current = current / part
         if current.is_symlink():
-            raise_error("Project paths must not contain symlinks.")
+            _fail("Project paths must not contain symlinks.")
         if current != path and current.exists() and not current.is_dir():
-            raise_error("A project path parent is not a directory.")
+            _fail("A project path parent is not a directory.")
     return path
 
 
@@ -151,21 +198,23 @@ class Envers:
             self.root if root is None else root, Path(".envers") / relative
         )
         if path.is_dir():
-            raise_error("A metadata file path points to a directory.")
+            _fail("A metadata file path points to a directory.")
         return path
 
     def _profile_path(self, profile: str) -> Path:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", profile) or (
             PureWindowsPath(f"{profile}.lock").is_reserved()
         ):
-            raise_error(
+            _fail(
                 "Profile names must start with a letter or digit and contain "
                 "only letters, digits, underscores, dots or hyphens. "
                 "Reserved device names are not allowed."
             )
         return self._metadata_path(f"data/{profile}.lock")
 
-    def _output_paths(self, files: dict[str, Any]) -> dict[str, Path]:
+    def _output_paths(
+        self, files: dict[str, Any], root: Optional[Path] = None
+    ) -> dict[str, Path]:
         paths: dict[str, Path] = {}
         for name in files:
             relative = PureWindowsPath(name)
@@ -181,344 +230,363 @@ class Envers:
                     for part in relative.parts
                 )
             ):
-                raise_error("Output files must use safe relative paths.")
-            if relative.parts[0].lower() in (".envers", ".git"):
-                raise_error(
-                    "Output files must not overwrite project metadata."
-                )
-            path = _checked_path(self.root, Path(*relative.parts))
+                _fail("Output files must use safe relative paths.")
+            if any(
+                part.lower() in (".envers", ".git") for part in relative.parts
+            ):
+                _fail("Output files must not overwrite project metadata.")
+            path = _checked_path(
+                self.root if root is None else root, Path(*relative.parts)
+            )
             if path.exists() and not path.is_file():
-                raise_error("An output file path is not a regular file.")
+                _fail("An output file path is not a regular file.")
             if any(
                 relative == other
                 or relative in other.parents
                 or other in relative.parents
                 for other in map(PureWindowsPath, paths)
             ):
-                raise_error("Output file paths conflict with each other.")
+                _fail("Output file paths conflict with each other.")
             paths[name] = path
         return paths
+
+    @contextmanager
+    def _session(self, *, read_only: bool = False) -> Iterator[None]:
+        lock = self._metadata_path("write.lock")
+        with storage.project_lock(lock, create=not read_only):
+            journal = self._metadata_path("transaction.json")
+            if read_only and journal.exists():
+                raise storage.StorageError(
+                    "A pending transaction requires recover."
+                )
+            if not read_only:
+                storage.recover(journal, self._metadata_path, _atomic_write)
+            yield
+
+    def _commit(self, files: dict[Path, str]) -> None:
+        storage.commit(
+            self._metadata_path("transaction.json"),
+            files,
+            self._metadata_path,
+            _atomic_write,
+        )
+
+    def _read_specs(self) -> dict[str, Any]:
+        path = self._metadata_path(ENVERS_SPEC_FILENAME)
+        if not path.exists():
+            _fail("Spec file not found. Please initialize envers first.")
+        try:
+            specs = validation.document(
+                yaml.safe_load(path.read_text(encoding="utf-8"))
+            )
+        except (yaml.YAMLError, UnicodeError):
+            _fail("Invalid public spec document.")
+        for item in specs["releases"].values():
+            self._output_paths(item["spec"]["files"])
+            for profile in item["profiles"]:
+                self._profile_path(profile)
+        return specs
+
+    def _release(self, specs: dict[str, Any], version: str) -> dict[str, Any]:
+        if version not in specs["releases"]:
+            _fail(f"Release {version} not found.")
+        return cast(dict[str, Any], specs["releases"][version])
 
     def _read_data_file(
         self, profile: str, password: str = ""
     ) -> dict[str, Any]:
         crypt.validate_password(password)
-        data_file = self._profile_path(profile)
+        return self._decode_profile(
+            self._profile_path(profile).read_text(encoding="utf-8"), password
+        )
 
-        with open(data_file, "r") as file:
-            try:
-                raw_data = file.read()
-                if not raw_data:
-                    return {}
-                data_content = crypt.decrypt_data(raw_data, password)
-                data_lock = yaml.safe_load(io.StringIO(data_content)) or {}
-            except InvalidToken:
-                raise_error("The given password is not correct. Try it again.")
-            except Exception:
-                raise_error(
-                    "The data.lock is not valid. Restore a valid backup "
-                    "before proceeding."
+    def _decode_profile(self, raw: str, password: str) -> dict[str, Any]:
+        try:
+            data = yaml.safe_load(crypt.decrypt_data(raw, password))
+            if not isinstance(data, dict) or not data:
+                _fail(
+                    "The data.lock is not valid; restore an encrypted backup."
                 )
+            return data
+        except InvalidToken:
+            _fail("The given password is not correct. Try it again.")
+        except (ValueError, TypeError, yaml.YAMLError, UnicodeError):
+            _fail("The data.lock is not valid; restore an encrypted backup.")
 
-        return data_lock
+    def _encode_profile(self, data: dict[str, Any], password: str) -> str:
+        return crypt.encrypt_data(
+            yaml.safe_dump(data, sort_keys=False), password
+        )
 
     def _write_data_file(
         self, profile: str, data: dict[str, Any], password: str = ""
     ) -> None:
-        data_file = self._profile_path(profile)
+        path = self._profile_path(profile)
+        content = self._encode_profile(data, password)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(path, content)
 
-        data_content = yaml.dump(data, sort_keys=False)
-        encrypted_data = crypt.encrypt_data(data_content, password)
-        os.makedirs(data_file.parent, exist_ok=True)
-        _atomic_write(data_file, encrypted_data)
+    def _check_store(
+        self, data: dict[str, Any], profile: str, specs: dict[str, Any]
+    ) -> None:
+        if (
+            set(data) != {"version", "profile", "releases"}
+            or data.get("version") != "1"
+            or data.get("profile") != profile
+        ):
+            _fail("Unsupported store; recreate it or restore a v1 backup.")
+        releases = data.get("releases")
+        if not isinstance(releases, dict) or not releases:
+            _fail("Profile has no valid releases.")
+        for version, entry in releases.items():
+            if not isinstance(version, str) or not isinstance(entry, dict):
+                _fail("Invalid stored release.")
+            current = self._release(specs, version)
+            if (
+                set(entry) != {"spec", "schema_id", "revision", "data"}
+                or profile not in current["profiles"]
+            ):
+                _fail("Invalid stored release binding.")
+            schema = validation.release(
+                entry.get("spec"), version, public=False
+            )
+            entry["spec"] = schema
+            identity = validation.schema_id(schema)
+            if (
+                entry.get("schema_id") != identity
+                or current.get("schema_id") != identity
+            ):
+                _fail(f"Release {version}: schema drift; draft a new release.")
+            if type(entry.get("revision")) is not int or entry["revision"] < 1:
+                _fail("Invalid profile value revision.")
+            if not isinstance(entry.get("data"), dict) or set(
+                entry["data"]
+            ) != {profile}:
+                _fail("Stored release belongs to a different profile.")
+            self._check_values(entry, profile, required=False)
+
+    def _check_values(
+        self,
+        entry: dict[str, Any],
+        profile: str,
+        *,
+        required: bool,
+        selected: Optional[list[str]] = None,
+    ) -> None:
+        definitions = entry["spec"]["spec"]["files"]
+        body = entry["data"][profile]
+        if not isinstance(body, dict) or not isinstance(
+            body.get("files"), dict
+        ):
+            _fail("Invalid stored profile files.")
+        files = body["files"]
+        if set(files) != set(definitions):
+            _fail("Stored files do not match the release contract.")
+        for name, info in files.items():
+            if not isinstance(info, dict) or info.get("type") != "dotenv":
+                _fail("Invalid stored file format.")
+            info["vars"] = validation.values(
+                definitions[name]["vars"],
+                info.get("vars"),
+                name,
+                required=required and (selected is None or name in selected),
+            )
+
+    def _load_profile(
+        self, profile: str, password: str, specs: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not self._profile_path(profile).exists():
+            _fail("Data lock file not found. Please deploy a version first.")
+        data = self._read_data_file(profile, password)
+        self._check_store(data, profile, specs)
+        return data
+
+    def _entry(self, data: dict[str, Any], version: str) -> dict[str, Any]:
+        if version not in data["releases"]:
+            _fail(f"Release {version} not found in profile.")
+        return cast(dict[str, Any], data["releases"][version])
+
+    def _save_profile(
+        self, profile: str, data: dict[str, Any], password: str
+    ) -> None:
+        self._commit(
+            {self._profile_path(profile): self._encode_profile(data, password)}
+        )
 
     def init(self, path: Path) -> None:
-        """
-        Initialize Envers instance.
+        """Initialize a project, including its process lock."""
+        project = Envers((self.root / path).resolve())
+        try:
+            with project._session():
+                target = project._metadata_path(ENVERS_SPEC_FILENAME)
+                if not target.exists():
+                    _atomic_write(target, "version: '0.1'\nreleases: {}\n")
+                    storage.sync_directory(target.parent)
+        except (
+            validation.InvalidConfiguration,
+            storage.StorageError,
+        ) as error:
+            raise_error(str(error))
 
-        Initialize the envers environment at the given path. This includes
-        creating a .envers folder and a spec.yaml file within it with default
-        content.
+    @_locked
+    def recover(self) -> None:
+        """Finish an interrupted commit; commands also recover first."""
+        typer.echo("Project recovery complete.")
 
-        Parameters
-        ----------
-        path : str, optional
-            The directory path where the envers environment will be
-            initialized. Defaults to the current directory (".").
+    def _read_dotenv(
+        self, path: Path, *, allow_unset: bool = False
+    ) -> dict[str, Any]:
+        values = {}
+        try:
+            with path.open(encoding="utf-8") as stream:
+                for binding in parse_stream(stream):
+                    if binding.error:
+                        _fail(
+                            "Invalid dotenv syntax at line "
+                            f"{binding.original.line}."
+                        )
+                    if binding.key is None:
+                        continue
+                    if not validation.NAME.fullmatch(binding.key):
+                        _fail("Invalid dotenv variable name.")
+                    if binding.value is None and not allow_unset:
+                        _fail("Variable has no value; use NAME= for empty.")
+                    values[binding.key] = binding.value
+        except (OSError, UnicodeError):
+            _fail("Cannot read dotenv input as UTF-8.")
+        return values
 
-        Returns
-        -------
-        None
-        """
-        root = (self.root / path).resolve()
-        spec_file = self._metadata_path(ENVERS_SPEC_FILENAME, root)
-
-        # Create .envers directory if it doesn't exist
-        os.makedirs(spec_file.parent, exist_ok=True)
-
-        if spec_file.exists():
-            return
-
-        # Create and write the default content to spec.yaml
-        _atomic_write(spec_file, "version: '0.1'\nreleases:\n")
-
+    @_locked
     def draft(
         self, version: str, from_spec: str = "", from_env: str = ""
     ) -> None:
-        """
-        Create a new draft version in the spec file.
-
-        Parameters
-        ----------
-        version : str
-            The version number for the new draft.
-        from_spec : str, optional
-            The version number from which to copy the spec.
-        from_env : str, optional
-            The .env file from which to import variable names. Values are not
-            copied into the spec.
-
-        Returns
-        -------
-        None
-        """
-        spec_file = self._metadata_path(ENVERS_SPEC_FILENAME)
-
-        if not spec_file.exists():
-            raise_error("Spec file not found. Please initialize envers first.")
-
-        with open(spec_file, "r") as file:
-            specs = yaml.safe_load(file) or {}
-
-        if not specs.get("releases", {}):
-            specs["releases"] = {}
-
-        existing_release = specs["releases"].get(version, {})
-        if existing_release and existing_release.get("status") != "draft":
-            raise_error(
-                f"Version {version} is not a draft and cannot be modified. "
-                "Create a new version with --from-spec instead."
-            )
-
-        if not specs["releases"].get(version, {}):
-            specs["releases"][version] = {
+        """Create or update a draft; dotenv input discovers names only."""
+        specs = self._read_specs()
+        existing = specs["releases"].get(version, {})
+        if existing and existing["status"] != "draft":
+            _fail("Release is not a draft; use --from-spec for a new version.")
+        if from_spec and from_env:
+            _fail("Choose --from-spec or --from-env, not both.")
+        release = (
+            copy.deepcopy(existing)
+            if existing
+            else {
                 "docs": "",
                 "status": "draft",
                 "profiles": ["base"],
                 "spec": {"files": {}},
             }
-
+        )
         if from_spec:
-            if not specs.get("releases", {}).get(from_spec, ""):
-                raise_error(
-                    f"Source version {from_spec} not found in specs.yaml."
-                )
-
-            specs["releases"][version] = merge_dicts(
-                specs["releases"][from_spec],
-                existing_release,
-            )
-            specs["releases"][version]["status"] = "draft"
-
+            release = merge_dicts(self._release(specs, from_spec), existing)
+            release["status"] = "draft"
+            release.pop("schema_id", None)
         elif from_env:
-            env_path = self._output_paths({from_env: {}})[from_env]
-            if not env_path.exists():
-                raise_error(f".env file {from_env} not found.")
-
-            env_vars = dotenv_values(env_path, interpolate=False)
-            spec_files = specs["releases"][version]["spec"]["files"]
-            file_spec = spec_files.setdefault(
+            path = self._output_paths({from_env: {}})[from_env]
+            names = self._read_dotenv(path, allow_unset=True)
+            info = release["spec"]["files"].setdefault(
                 from_env, {"docs": "", "type": "dotenv", "vars": {}}
             )
-            variables = file_spec.setdefault("vars", {})
-            for var in env_vars:
-                variables.setdefault(var, {"docs": "", "type": "string"})
+            for name in names:
+                info["vars"].setdefault(name, {"docs": "", "type": "string"})
+        specs["releases"][version] = validation.release(release, version)
+        self._output_paths(release["spec"]["files"])
+        self._commit(
+            {
+                self._metadata_path(ENVERS_SPEC_FILENAME): yaml.safe_dump(
+                    specs, sort_keys=False
+                )
+            }
+        )
 
-        self._output_paths(specs["releases"][version]["spec"]["files"])
-        _atomic_write(spec_file, yaml.dump(specs, sort_keys=False))
-
+    @_locked
     def deploy(
         self, profile: str, spec: str, password: Optional[str] = None
     ) -> None:
-        """
-        Deploy a new release to .envers/data/<profile>.lock.
-
-        Existing releases in that profile are preserved. Use profile_set to
-        change values, or draft a new version to change the schema.
-
-        Parameters
-        ----------
-        profile : str
-            The profile to be deployed.
-        spec : str
-            The version number to be deployed.
-        password : Optional[str]
-            The password to be used for that profile.
-
-        Returns
-        -------
-        None
-        """
-        specs_file = self._metadata_path(ENVERS_SPEC_FILENAME)
-        data_file = self._profile_path(profile)
-
-        if not specs_file.exists():
-            raise_error("Spec file not found. Please initialize envers first.")
-
-        with open(specs_file, "r") as file:
-            specs = yaml.safe_load(file) or {}
-
-        if not specs.get("releases", {}).get(spec, ""):
-            raise_error(f"Version {spec} not found in specs.yaml.")
-
-        spec_data = copy.deepcopy(specs["releases"][spec])
-        self._output_paths(spec_data.get("spec", {}).get("files", {}))
-
-        if not profile or profile not in spec_data.get("profiles", []):
-            raise_error(
-                f"Profile '{profile}' is not defined for version {spec}."
-            )
-
-        if spec_data.get("status") not in ("draft", "deployed"):
-            raise_error(f"Version {spec} is not available for deployment.")
-
-        # all data in the data.lock file are deployed
-        del spec_data["status"]
-
-        if data_file.exists():
-            if password is None:
-                password = crypt.get_password()
-
-            data_lock = self._read_data_file(profile, password)
-
-            if not data_lock or not isinstance(
-                data_lock.get("releases"), dict
+        """Bind a profile to an immutable schema; unset values stay absent."""
+        specs = self._read_specs()
+        release = self._release(specs, spec)
+        if profile not in release["profiles"]:
+            _fail(f"Profile '{profile}' is not defined for this release.")
+        if release["status"] not in ("draft", "deployed"):
+            _fail("Release is not available for deployment.")
+        path = self._profile_path(profile)
+        if password is None:
+            password = crypt.get_password()
+            if not path.exists() and password != crypt.get_password(
+                "Confirm your password"
             ):
-                raise_error(
-                    "The data.lock is not valid. Restore a valid backup "
-                    "before proceeding."
+                _fail("The password and confirmation do not match.")
+        crypt.validate_password(password)
+        if path.exists():
+            data = self._load_profile(profile, password, specs)
+            if spec in data["releases"]:
+                _fail(
+                    "Release is already deployed; use profile-set "
+                    "or draft a new version."
                 )
-
-            if spec in data_lock["releases"]:
-                raise_error(
-                    f"Version {spec} is already deployed for profile "
-                    f"'{profile}'. Use profile-set to update values, or "
-                    "draft a new version to change the spec."
-                )
-
-            data_lock["releases"][spec] = {"spec": spec_data, "data": {}}
         else:
-            data_lock = {
-                "version": specs["version"],
-                "releases": {spec: {"spec": spec_data, "data": {}}},
+            data = {"version": "1", "profile": profile, "releases": {}}
+        schema = copy.deepcopy(release)
+        schema.pop("status", None)
+        schema.pop("schema_id", None)
+        identity = validation.schema_id(schema)
+        files = {}
+        for name, info in schema["spec"]["files"].items():
+            files[name] = {
+                "type": "dotenv",
+                "vars": {
+                    key: copy.deepcopy(definition["default"])
+                    for key, definition in info["vars"].items()
+                    if "default" in definition
+                },
             }
+        data["releases"][spec] = {
+            "spec": schema,
+            "schema_id": identity,
+            "revision": 1,
+            "data": {profile: {"files": files}},
+        }
+        release.update(status="deployed", schema_id=identity)
+        spec_content = yaml.safe_dump(specs, sort_keys=False)
+        self._commit(
+            {
+                path: self._encode_profile(data, password),
+                self._metadata_path(ENVERS_SPEC_FILENAME): spec_content,
+            }
+        )
 
-            if password is None:
-                new_password = crypt.get_password()
-                new_password_confirmation = crypt.get_password(
-                    "Confirm your password"
-                )
-
-                if new_password != new_password_confirmation:
-                    raise_error(
-                        "The password and confirmation do not match. "
-                        "Please try again."
-                    )
-
-                password = new_password
-
-        # Populate data with default values
-        for profile_name in spec_data.get("profiles", []):
-            profile_data: dict["str", dict[str, Any]] = {"files": {}}
-            for file_path, file_info in (
-                spec_data.get("spec", {}).get("files", {}).items()
-            ):
-                file_data = {
-                    "type": file_info.get("type", "dotenv"),
-                    "vars": {},
-                }
-                for var_name, var_info in file_info.get("vars", {}).items():
-                    default_value = var_info.get("default", "")
-                    file_data["vars"][var_name] = default_value
-                profile_data["files"][file_path] = file_data
-            data_lock["releases"][spec]["data"][profile_name] = profile_data
-
-        specs["releases"][spec]["status"] = "deployed"
-        spec_content = yaml.dump(specs, sort_keys=False)
-
-        self._write_data_file(profile, data_lock, password)
-        _atomic_write(specs_file, spec_content)
-
+    @_locked
     def profile_set(
         self, profile: str, spec: str, password: Optional[str] = None
     ) -> None:
-        """
-        Set the profile values for a given spec version.
-
-        Parameters
-        ----------
-        profile : str
-            The name of the profile to set values for.
-        spec : str
-            The version of the spec to use.
-        password : Optional[str]
-            The password to be used for that profile.
-
-        Returns
-        -------
-        None
-        """
-        data_file = self._profile_path(profile)
-
-        if not data_file.exists():
-            raise_error(
-                "Data lock file not found. Please deploy a version first."
-            )
-
-        if password is None:
-            password = crypt.get_password()
-
-        data_lock = self._read_data_file(profile, password)
-
-        if not data_lock.get("releases", {}).get(spec, ""):
-            raise_error(f"Version {spec} not found in data.lock.")
-
-        release_data = data_lock["releases"][spec]
-        profile_data = release_data.get("data", {}).get(profile, {})
-
-        if not (profile_data and profile_data.get("files", {})):
-            raise_error(
-                f"There is no data spec for version '{spec}' "
-                f"and profile '{profile}'"
-            )
-
-        # Iterate over files and variables
-        size = shutil.get_terminal_size()
-
-        profile_title = f" Profile: {profile} ".center(size.columns, "=")
-        typer.echo(f"\n{profile_title}\n")
-
-        for file_path, file_info in profile_data.get("files", {}).items():
-            file_title = f">>> File: {file_path} "
-            typer.echo(f"{file_title}\n")
-            for var_name in file_info.get("vars", {}):
-                new_value = typer.prompt(
-                    f"Enter value for `{var_name}` (Enter to keep current)",
+        """Edit values privately; Enter retains the current or unset value."""
+        specs = self._read_specs()
+        password = crypt.get_password() if password is None else password
+        data = self._load_profile(profile, password, specs)
+        entry = self._entry(data, spec)
+        before = copy.deepcopy(entry["data"])
+        width = shutil.get_terminal_size().columns
+        typer.echo(f" Profile: {profile} ".center(width, "="))
+        for filename, info in entry["spec"]["spec"]["files"].items():
+            typer.echo(f">>> File: {filename}")
+            values = entry["data"][profile]["files"][filename]["vars"]
+            for name, definition in info["vars"].items():
+                value = typer.prompt(
+                    f"Enter value for `{name}` (Enter to keep current)",
                     default="",
                     show_default=False,
                     hide_input=True,
                 )
-                if new_value:
-                    file_info["vars"][var_name] = new_value
+                if value:
+                    values[name] = validation.coerce(
+                        definition, value, f"{filename}/{name}"
+                    )
+        if before != entry["data"]:
+            entry["revision"] += 1
+            self._save_profile(profile, data, password)
 
-            # update the size for each iteration
-            size = shutil.get_terminal_size()
-            typer.echo(f"\n{size.columns * '-'}\n")
-
-        # Update data.lock file
-        data_lock["releases"][spec]["data"][profile] = profile_data
-        self._write_data_file(profile, data_lock, password)
-
+    @_locked
     def profile_import(
         self,
         profile: str,
@@ -527,105 +595,235 @@ class Envers:
         file_path: str = "",
         password: Optional[str] = None,
     ) -> None:
-        """Import literal dotenv values into one deployed profile file."""
-        data_file = self._profile_path(profile)
-        if not data_file.exists():
-            raise_error(
-                "Data lock file not found. Please deploy a version first."
-            )
-        if password is None:
-            password = crypt.get_password()
-        data_lock = self._read_data_file(profile, password)
-        release = data_lock.get("releases", {}).get(spec, {})
-        files = release.get("data", {}).get(profile, {}).get("files", {})
+        """Import literal typed values, rejecting the entire input on error."""
+        specs = self._read_specs()
+        password = crypt.get_password() if password is None else password
+        data = self._load_profile(profile, password, specs)
+        entry = self._entry(data, spec)
         target = file_path or from_env
+        files = entry["data"][profile]["files"]
         if target not in files:
-            raise_error("Target file is not declared in this profile release.")
-        if files[target].get("type", "dotenv") != "dotenv":
-            raise_error("Only dotenv files can be imported.")
-
-        values: dict[str, str] = {}
-        try:
-            with open(self.root / from_env, encoding="utf-8") as file:
-                for binding in parse_stream(file):
-                    if binding.error:
-                        raise_error(
-                            "Invalid dotenv syntax at line "
-                            f"{binding.original.line}."
-                        )
-                    if binding.key is None:
-                        continue
-                    if binding.key not in files[target].get("vars", {}):
-                        raise_error("Dotenv contains an undeclared variable.")
-                    if binding.value is None:
-                        raise_error(
-                            "Dotenv contains a variable without a value. "
-                            "Use NAME= for an empty value."
-                        )
-                    values[binding.key] = binding.value
-        except (OSError, UnicodeError):
-            raise_error("Cannot read dotenv input as UTF-8.")
-        if not values:
-            raise_error("Dotenv input contains no values.")
-
-        files[target]["vars"].update(values)
-        self._write_data_file(profile, data_lock, password)
+            _fail("Target file is not declared in this profile release.")
+        incoming = self._read_dotenv(self.root / from_env)
+        if not incoming:
+            _fail("Dotenv input contains no values.")
+        definitions = entry["spec"]["spec"]["files"][target]["vars"]
+        values = validation.values(
+            definitions, incoming, target, required=False
+        )
+        updated = {**files[target]["vars"], **values}
+        if updated != files[target]["vars"]:
+            files[target]["vars"] = updated
+            entry["revision"] += 1
+            self._save_profile(profile, data, password)
         typer.echo("Profile values imported.")
 
+    def _export_root(self, directory: Optional[Path]) -> Path:
+        if directory is None:
+            return self.root
+        root = (self.root / directory).resolve()
+        if root.exists() and not root.is_dir():
+            _fail("Output placement must be a directory.")
+        if any(part.lower() in (".envers", ".git") for part in root.parts):
+            _fail("Output placement must not overwrite project metadata.")
+        return root
+
+    @_locked
     def profile_load(
-        self, profile: str, spec: str, password: Optional[str] = None
+        self,
+        profile: str,
+        spec: str,
+        password: Optional[str] = None,
+        *,
+        files: Optional[list[str]] = None,
+        output_dir: Optional[Path] = None,
+        format: str = "dotenv",
     ) -> None:
-        """
-        Load a specific environment profile to files.
-
-        Load a specific environment profile to files based on the given
-        spec version.
-
-        Parameters
-        ----------
-        profile : str
-            The name of the profile to load.
-        spec : str
-            The version of the spec to use.
-        password : Optional[str]
-            The password to be used for that profile.
-
-        Returns
-        -------
-        None
-        """
-        data_file = self._profile_path(profile)
-
-        if not data_file.exists():
-            raise_error(
-                "Data lock file not found. Please deploy a version first."
+        """Export selected files; compose format escapes literal dollars."""
+        if format not in ("dotenv", "compose"):
+            _fail("Export format must be dotenv or compose.")
+        specs = self._read_specs()
+        password = crypt.get_password() if password is None else password
+        data = self._load_profile(profile, password, specs)
+        entry = self._entry(data, spec)
+        source = entry["data"][profile]["files"]
+        selected = list(source) if files is None else files
+        if (
+            not selected
+            or len(set(selected)) != len(selected)
+            or set(selected) - set(source)
+        ):
+            _fail("Select unique files declared in this release.")
+        self._check_values(entry, profile, required=True, selected=selected)
+        root = self._export_root(output_dir)
+        paths = self._output_paths(
+            {name: source[name] for name in selected}, root
+        )
+        output = {
+            paths[name]: _render_dotenv(
+                source[name]["vars"], compose=format == "compose"
             )
-
-        if password is None:
-            password = crypt.get_password()
-
-        data_lock = self._read_data_file(profile, password)
-
-        if not data_lock.get("releases", {}).get(spec, ""):
-            raise_error(f"Version {spec} not found in data.lock.")
-
-        release_data = data_lock["releases"][spec]
-        profile_data = release_data.get("data", {}).get(profile, {"files": {}})
-
-        files = profile_data.get("files", {})
-        paths = self._output_paths(files)
-        output_files = {}
-        for file_path, file_info in files.items():
-            if file_info.get("type", "dotenv") != "dotenv":
-                raise_error("Only dotenv files can be exported.")
-            output_files[paths[file_path]] = _render_dotenv(
-                file_info.get("vars", {})
-            )
-        for path, content in output_files.items():
+            for name in selected
+        }
+        for path, content in output.items():
             path.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write(path, content)
+        typer.echo("Environment files created/updated.")
 
-        typer.echo(
-            f"Environment files for profile '{profile}' and spec version "
-            f"'{spec}' have been created/updated."
+    def validate(
+        self, spec: str, profile: str = "", password: Optional[str] = None
+    ) -> list[str]:
+        """Return diagnostics without values, prompts or file writes."""
+        try:
+            with self._session(read_only=True):
+                specs = self._read_specs()
+                self._release(specs, spec)
+                if profile:
+                    if password is None:
+                        _fail("A password is required for profile validation.")
+                    data = self._load_profile(profile, password, specs)
+                    self._check_values(
+                        self._entry(data, spec), profile, required=True
+                    )
+            return []
+        except (
+            validation.InvalidConfiguration,
+            storage.StorageError,
+            typer.BadParameter,
+        ) as error:
+            return [str(error)]
+        except OSError:
+            return [
+                "Cannot read project; initialize it or check file permissions."
+            ]
+
+    def compare(self, from_spec: str, to_spec: str) -> dict[str, Any]:
+        """Compare schema contracts without decrypting or displaying values."""
+        with self._session(read_only=True):
+            specs = self._read_specs()
+            previous = self._release(specs, from_spec)
+            target = self._release(specs, to_spec)
+            old = previous["spec"]["files"]
+            new = target["spec"]["files"]
+            result: dict[str, Any] = {
+                "profiles_added": sorted(
+                    set(target["profiles"]) - set(previous["profiles"])
+                ),
+                "profiles_removed": sorted(
+                    set(previous["profiles"]) - set(target["profiles"])
+                ),
+                "files_added": sorted(set(new) - set(old)),
+                "files_removed": sorted(set(old) - set(new)),
+                "added": [],
+                "removed": [],
+                "changed": [],
+                "migration": [],
+                "needs_input": [],
+            }
+            for filename in sorted(set(old) | set(new)):
+                lhs = old.get(filename, {}).get("vars", {})
+                rhs = new.get(filename, {}).get("vars", {})
+                for name in sorted(set(lhs) | set(rhs)):
+                    identifier = f"{filename}/{name}"
+                    if name not in lhs:
+                        result["added"].append(identifier)
+                    elif name not in rhs:
+                        result["removed"].append(identifier)
+                    else:
+                        left = {
+                            key: value
+                            for key, value in lhs[name].items()
+                            if key != "docs"
+                        }
+                        right = {
+                            key: value
+                            for key, value in rhs[name].items()
+                            if key != "docs"
+                        }
+                        for definition in (left, right):
+                            definition.setdefault("type", "string")
+                            definition.setdefault("required", False)
+                        if left != right:
+                            result["changed"].append(identifier)
+                        if any(
+                            left.get(rule) != right.get(rule)
+                            for rule in ("type", "allowed")
+                        ):
+                            result["migration"].append(identifier)
+                    if (
+                        name in rhs
+                        and rhs[name].get("required")
+                        and "default" not in rhs[name]
+                        and (name not in lhs or lhs[name] != rhs[name])
+                    ):
+                        result["needs_input"].append(identifier)
+            return result
+
+    @_locked
+    def profile_versions(
+        self, profile: str, password: Optional[str] = None
+    ) -> list[dict[str, Any]]:
+        """List schema identities and current value revision numbers."""
+        specs = self._read_specs()
+        password = crypt.get_password() if password is None else password
+        data = self._load_profile(profile, password, specs)
+        return [
+            {
+                "version": version,
+                "schema_id": entry["schema_id"],
+                "revision": entry["revision"],
+            }
+            for version, entry in data["releases"].items()
+        ]
+
+    @_locked
+    def profile_password(
+        self,
+        profile: str,
+        password: Optional[str] = None,
+        new_password: Optional[str] = None,
+    ) -> None:
+        """Re-encrypt releases with a new password; retain their values."""
+        specs = self._read_specs()
+        password = crypt.get_password() if password is None else password
+        data = self._load_profile(profile, password, specs)
+        if new_password is None:
+            new_password = crypt.get_password("Enter the new password")
+            if new_password != crypt.get_password("Confirm the new password"):
+                _fail("The new password and confirmation do not match.")
+        crypt.validate_password(new_password)
+        self._save_profile(profile, data, new_password)
+        typer.echo("Profile password changed.")
+
+    @_locked
+    def profile_backup(
+        self, profile: str, destination: Path, password: Optional[str] = None
+    ) -> None:
+        """Write an encrypted backup protected by the current password."""
+        specs = self._read_specs()
+        password = crypt.get_password() if password is None else password
+        self._load_profile(profile, password, specs)
+        destination = self.root / destination
+        root = self._export_root(destination.parent)
+        path = self._output_paths({destination.name: {}}, root)[
+            destination.name
+        ]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(
+            path, self._profile_path(profile).read_text(encoding="utf-8")
         )
+        typer.echo("Encrypted profile backup created.")
+
+    @_locked
+    def profile_restore(
+        self, profile: str, source: Path, password: Optional[str] = None
+    ) -> None:
+        """Restore a missing/corrupt profile from a compatible backup."""
+        specs = self._read_specs()
+        password = crypt.get_password() if password is None else password
+        data = self._decode_profile(
+            (self.root / source).read_text(encoding="utf-8"), password
+        )
+        self._check_store(data, profile, specs)
+        self._save_profile(profile, data, password)
+        typer.echo("Encrypted profile restored.")

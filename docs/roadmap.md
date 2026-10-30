@@ -28,15 +28,15 @@ open work.
       using private temporary files (owner-only permissions on POSIX).
 - [x] Write specs atomically during initialization, drafting and deployment,
       using private temporary files (owner-only permissions on POSIX).
-- [ ] Add concurrency control and recovery across lock/spec updates. Atomic
+- [x] Add concurrency control and recovery across lock/spec updates. Atomic
       replacement of each file does not make deployment a transaction or
       guarantee power-loss durability.
-- [ ] Validate profile/output paths against an explicit root, including symlinks
+- [x] Validate profile/output paths against an explicit root, including symlinks
       and collisions with project metadata.
-- [ ] Specify native Fernet envelope/KDF settings, password rotation and
+- [x] Specify native Fernet envelope/KDF settings, password rotation and
       recovery. SOPS and additional storage backends are optional integrations
       driven by user demand; defer a provider framework.
-- [ ] Declare the build backend and verify a clean wheel installation, declared
+- [x] Declare the build backend and verify a clean wheel installation, declared
       dependencies and version reporting; align Python tooling.
 
 Done when synthetic secrets stay out of public specs/logs and failed operations
@@ -45,20 +45,20 @@ credential rotation. Complete this phase before recommending production secrets.
 
 ## 3. Enforce the release contract
 
-- [ ] Validate document structure, types, required values, allowed values,
+- [x] Validate document structure, types, required values, allowed values,
       supported files and unset versus empty values.
-- [ ] Add non-interactive validation with useful exit codes and diagnostics that
+- [x] Add non-interactive validation with useful exit codes and diagnostics that
       omit values; expose the same behavior through a small Python API.
-- [ ] Bind profiles to one schema identity per release; detect manual drift.
+- [x] Bind profiles to one schema identity per release; detect manual drift.
       Define schema releases versus value revisions before adding
       history/rollback.
-- [ ] Compare releases and report variables that need operator input or
+- [x] Compare releases and report variables that need operator input or
       migration.
 - [x] Quote literal dotenv output and test hashes, quotes, newlines, backslashes
       and dollar signs with python-dotenv interpolation disabled.
-- [ ] Verify dotenv output with Compose, including its interpolation rules,
+- [x] Verify dotenv output with Compose, including its interpolation rules,
       before Sugar integration.
-- [ ] Add selective file export and explicit output placement; replace the
+- [x] Add selective file export and explicit output placement; replace the
       `profile-versions` stub with useful behavior or remove it.
 - [x] Replace outdated usage instructions with one tested import/export
       walkthrough. Clean package installation remains part of phase 2.

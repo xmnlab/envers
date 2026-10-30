@@ -19,28 +19,36 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Envers:
     """Store synthetic profile values without requiring a terminal."""
     monkeypatch.chdir(tmp_path)
     project = Envers()
-    project._write_data_file(
-        "base",
-        {
-            "releases": {
-                "1.0": {
-                    "data": {
-                        "base": {
-                            "files": {
-                                ".env": {
-                                    "vars": {
-                                        "TOKEN": "synthetic-old-token",
-                                        "RETRIES": 3,
-                                    }
-                                }
-                            }
+    project.init(Path("."))
+    spec = {
+        "version": "0.1",
+        "releases": {
+            "1.0": {
+                "status": "draft",
+                "profiles": ["base"],
+                "spec": {
+                    "files": {
+                        ".env": {
+                            "type": "dotenv",
+                            "vars": {
+                                "TOKEN": {
+                                    "type": "string",
+                                    "default": "synthetic-old-token",
+                                },
+                                "RETRIES": {"type": "int", "default": 3},
+                            },
                         }
                     }
-                }
+                },
             }
         },
-        PASSWORD,
+    }
+    import yaml
+
+    Path(".envers/specs.yaml").write_text(
+        yaml.safe_dump(spec, sort_keys=False)
     )
+    project.deploy("base", "1.0", PASSWORD)
     return project
 
 

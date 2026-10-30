@@ -30,6 +30,8 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Envers:
     project.deploy("base", "1.0", PASSWORD)
     project.draft("2.0", from_spec="1.0")
     project.deploy("base", "2.0", PASSWORD)
+    Path(".env").write_text("KEEP=synthetic-existing\n")
+    project.profile_import("base", "1.0", ".env", password=PASSWORD)
     return project
 
 
@@ -68,7 +70,7 @@ def test_import_and_export_preserve_literal_values(
     variables = after["releases"]["1.0"]["data"]["base"]["files"][".env"][
         "vars"
     ]
-    assert variables == {**expected, "KEEP": ""}
+    assert variables == {**expected, "KEEP": "synthetic-existing"}
     assert after["releases"]["2.0"] == before["releases"]["2.0"]
     for text in (PASSWORD, "synthetic #", "synthetic-host-value"):
         assert text not in result.output

@@ -1,8 +1,15 @@
-"""Functions for cryptography."""
+"""Native v1 envelope: JSON with format, kdf, iterations, salt and token.
+
+The salt is 16 random bytes encoded as hex. PBKDF2-HMAC-SHA256 uses 1,200,000
+iterations and derives a 32-byte Fernet key. The Fernet token authenticates the
+encrypted document. KDF parameters are fixed for this envelope version and
+checked before derivation. Old unversioned profiles must be recreated.
+"""
 
 from __future__ import annotations
 
 import base64
+import json
 import os
 import sys
 
@@ -16,6 +23,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 SALT_LENGTH = 16
+KDF_ITERATIONS = 1_200_000
 
 
 def create_fernet_key(password: str, salt: bytes) -> bytes:
@@ -25,7 +33,7 @@ def create_fernet_key(password: str, salt: bytes) -> bytes:
         algorithm=hashes.SHA256(),
         length=32,
         salt=salt,
-        iterations=100000,
+        iterations=KDF_ITERATIONS,
         backend=default_backend(),
     )
     return base64.urlsafe_b64encode(kdf.derive(password.encode("utf-8")))
@@ -70,12 +78,20 @@ def encrypt_data(data: str, password: Optional[str] = None) -> str:
     validate_password(password)
 
     salt = generate_salt()
-    salt_hex = salt.hex()
     key = create_fernet_key(password, salt)
     cipher_suite = Fernet(key)
 
     encrypted = cipher_suite.encrypt(data.encode("utf-8")).decode("utf-8")
-    return salt_hex + encrypted
+    return json.dumps(
+        {
+            "format": "envers-v1",
+            "kdf": "pbkdf2-sha256",
+            "iterations": KDF_ITERATIONS,
+            "salt": salt.hex(),
+            "token": encrypted,
+        },
+        sort_keys=True,
+    )
 
 
 def decrypt_data(data: str, password: Optional[str] = None) -> str:
@@ -84,12 +100,27 @@ def decrypt_data(data: str, password: Optional[str] = None) -> str:
         password = get_password()
     validate_password(password)
 
-    HEX_SALT_LENGTH = SALT_LENGTH * 2
-
-    salt_hex, data_clean = data[:HEX_SALT_LENGTH], data[HEX_SALT_LENGTH:]
-    salt = bytes.fromhex(salt_hex)
+    envelope = json.loads(data)
+    if (
+        not isinstance(envelope, dict)
+        or set(envelope) != {"format", "kdf", "iterations", "salt", "token"}
+        or (
+            envelope["format"] != "envers-v1"
+            or envelope["kdf"] != "pbkdf2-sha256"
+            or type(envelope["iterations"]) is not int
+            or envelope["iterations"] != KDF_ITERATIONS
+            or not isinstance(envelope["salt"], str)
+            or not isinstance(envelope["token"], str)
+        )
+    ):
+        raise ValueError("Unsupported encrypted profile envelope")
+    salt = bytes.fromhex(envelope["salt"])
+    if len(salt) != SALT_LENGTH:
+        raise ValueError("Invalid profile salt")
 
     key = create_fernet_key(password, salt)
     cipher_suite = Fernet(key)
 
-    return cipher_suite.decrypt(data_clean.encode("utf-8")).decode("utf-8")
+    return cipher_suite.decrypt(envelope["token"].encode("utf-8")).decode(
+        "utf-8"
+    )

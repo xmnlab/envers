@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import typer
 import yaml
 
 from envers import crypt
@@ -96,15 +97,19 @@ def test_failed_draft_preserves_spec(
         raise OSError("synthetic spec failure")
 
     if failure == "serialize":
-        monkeypatch.setattr(yaml, "dump", fail_save)
+        monkeypatch.setattr(yaml, "safe_dump", fail_save)
     else:
         monkeypatch.setattr(os, "replace", fail_save)
 
-    with pytest.raises(OSError, match="synthetic spec failure"):
+    with pytest.raises(typer.Exit):
         project.draft("2.0")
 
     assert SPEC_PATH.read_bytes() == before
-    assert set(SPEC_PATH.parent.iterdir()) == {SPEC_PATH, LOCK_PATH.parent}
+    assert set(SPEC_PATH.parent.iterdir()) == {
+        SPEC_PATH,
+        LOCK_PATH.parent,
+        Path(".envers/write.lock"),
+    }
 
 
 def test_failed_deployment_spec_save_keeps_both_files_readable(
@@ -123,11 +128,22 @@ def test_failed_deployment_spec_save_keeps_both_files_readable(
             raise OSError("synthetic spec failure")
         replace(source, destination)
 
-    monkeypatch.setattr(os, "replace", fail_spec_replace)
-    with pytest.raises(OSError, match="synthetic spec failure"):
-        project.deploy("base", "1.0", PASSWORD)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "replace", fail_spec_replace)
+        with pytest.raises(typer.Exit):
+            project.deploy("base", "1.0", PASSWORD)
 
     assert SPEC_PATH.read_bytes() == before
     assert "1.0" in project._read_data_file("base", PASSWORD)["releases"]
-    assert set(SPEC_PATH.parent.iterdir()) == {SPEC_PATH, LOCK_PATH.parent}
+    assert Path(".envers/transaction.json").exists()
+    assert project.validate("1.0", "base", PASSWORD) == [
+        "A pending transaction requires recover."
+    ]
+    project.recover()
+    assert (
+        yaml.safe_load(SPEC_PATH.read_text())["releases"]["1.0"]["status"]
+        == "deployed"
+    )
+    assert not Path(".envers/transaction.json").exists()
+    assert project.validate("1.0", "base", PASSWORD) == []
     assert list(LOCK_PATH.parent.iterdir()) == [LOCK_PATH]

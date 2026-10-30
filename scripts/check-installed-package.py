@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -112,6 +113,16 @@ def main() -> None:
         )
         expected = 'TOKEN="synthetic-${REFERENCE}"\n'
         assert (work / ".env").read_text() == expected
+        result = run(
+            cli,
+            "validate",
+            "--profile",
+            "base",
+            "--spec",
+            "1.0",
+            input=f"{password}\n",
+        )
+        assert json.loads(result) == {"valid": True, "errors": []}
         print(f"Installed Envers {version}: version and encrypted workflow OK")
 
 

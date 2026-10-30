@@ -6,9 +6,11 @@ from pathlib import Path
 
 import pytest
 import typer
+import yaml
 
 from dotenv import dotenv_values
 from envers.core import Envers
+from envers.validation import InvalidConfiguration, schema_id
 
 PASSWORD = "synthetic path password"
 
@@ -23,10 +25,48 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Envers:
 
 
 def _store_outputs(project: Envers, names: list[str]) -> None:
-    files = {name: {"vars": {"TOKEN": "synthetic-value"}} for name in names}
+    schema = {
+        "profiles": ["base"],
+        "spec": {
+            "files": {
+                name: {"type": "dotenv", "vars": {"TOKEN": {"type": "string"}}}
+                for name in names
+            }
+        },
+    }
+    identity = schema_id(schema)
+    Path(".envers/specs.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "version": "0.1",
+                "releases": {
+                    "1.0": {
+                        **schema,
+                        "status": "deployed",
+                        "schema_id": identity,
+                    }
+                },
+            }
+        )
+    )
+    files = {
+        name: {"type": "dotenv", "vars": {"TOKEN": "synthetic-value"}}
+        for name in names
+    }
     project._write_data_file(
         "base",
-        {"releases": {"1.0": {"data": {"base": {"files": files}}}}},
+        {
+            "version": "1",
+            "profile": "base",
+            "releases": {
+                "1.0": {
+                    "spec": schema,
+                    "schema_id": identity,
+                    "revision": 1,
+                    "data": {"base": {"files": files}},
+                }
+            },
+        },
         PASSWORD,
     )
 
@@ -37,7 +77,7 @@ def test_profile_names_cannot_select_paths(
 ) -> None:
     """Reject path separators before creating or replacing profile files."""
     project._write_data_file("base", {}, PASSWORD)
-    with pytest.raises(typer.Exit):
+    with pytest.raises(InvalidConfiguration):
         project._write_data_file(profile, {}, PASSWORD)
     assert set(Path(".envers/data").iterdir()) == {
         Path(".envers/data/base.lock")
